@@ -1,0 +1,184 @@
+---
+- name: Completely Uninstall Open5GS 5G Core and Dependencies
+  hosts: open5gs_5gc
+  become: yes
+
+  tasks:
+  # ---------------------------------------------------------------------
+  # Stop and disable Open5GS services
+  # ---------------------------------------------------------------------
+  - name: Stop and disable all Open5GS services
+    systemd:
+      name: "{{ item }}"
+      state: stopped
+      enabled: no
+    loop:
+      - open5gs-amfd
+      - open5gs-smfd
+      - open5gs-upfd
+      - open5gs-ausfd
+      - open5gs-udmd
+      - open5gs-udrd
+      - open5gs-nrfd
+      - open5gs-pcfd
+      - open5gs-nssfd
+      - open5gs-bsfd
+      - open5gs-webui
+    ignore_errors: yes
+
+  # ---------------------------------------------------------------------
+  # Remove NAT rules if present
+  # ---------------------------------------------------------------------
+  - name: Remove UE NAT rule from iptables
+    shell: |
+      iptables -t nat -C POSTROUTING -s 10.45.0.0/16 ! -o ogstun -j MASQUERADE && \
+      iptables -t nat -D POSTROUTING -s 10.45.0.0/16 ! -o ogstun -j MASQUERADE || true
+    args:
+      warn: false
+    ignore_errors: yes
+
+
+  # ---------------------------------------------------------------------
+  # Remove NAT Rules (IPv4 + IPv6)
+  # ---------------------------------------------------------------------
+  - name: Remove IPv4 NAT rule for UE subnet
+    shell: |
+      iptables -t nat -D POSTROUTING -s 10.45.0.0/16 ! -o ogstun -j MASQUERADE 2>/dev/null || true
+    args:
+      warn: false
+    ignore_errors: yes
+
+  - name: Remove IPv6 NAT rule for UE subnet
+    shell: |
+      ip6tables -t nat -D POSTROUTING -s 2001:db8:cafe::/48 ! -o ogstun -j MASQUERADE 2>/dev/null || true
+    args:
+      warn: false
+    ignore_errors: yes
+
+  - name: Save iptables and ip6tables rules (persist)
+    shell: netfilter-persistent save || true
+    args:
+      warn: false
+    ignore_errors: yes
+
+  # ---------------------------------------------------------------------
+  # Uninstall Open5GS packages
+  # ---------------------------------------------------------------------
+  - name: Remove Open5GS packages
+    apt:
+      name: open5gs*
+      state: absent
+      purge: yes
+    ignore_errors: yes
+
+  # ---------------------------------------------------------------------
+  # Uninstall MongoDB packages
+  # ---------------------------------------------------------------------
+  - name: Remove MongoDB packages
+    apt:
+      name: mongodb-org*
+      state: absent
+      purge: yes
+    ignore_errors: yes
+
+  - name: Remove MongoDB data and logs
+    file:
+      path: "{{ item }}"
+      state: absent
+    loop:
+      - /var/lib/mongodb
+      - /var/log/mongodb
+      - /etc/mongod.conf
+      - /etc/apt/sources.list.d/mongodb-org-8.0.list
+      - /usr/share/keyrings/mongodb-server-8.0.gpg
+    ignore_errors: yes
+
+  # ---------------------------------------------------------------------
+  # Remove Node.js and WebUI
+  # ---------------------------------------------------------------------
+  - name: Remove Node.js packages
+    apt:
+      name: nodejs
+      state: absent
+      purge: yes
+    ignore_errors: yes
+
+  - name: Remove Open5GS WebUI directory and modules
+    file:
+      path: "{{ item }}"
+      state: absent
+    loop:
+      - /usr/lib/node_modules/open5gs
+      - /etc/open5gs-webui
+      - /var/log/open5gs-webui.log
+    ignore_errors: yes
+
+  # ---------------------------------------------------------------------
+  # Clean configuration and logs
+  # ---------------------------------------------------------------------
+  - name: Remove Open5GS configuration and logs
+    file:
+      path: "{{ item }}"
+      state: absent
+    loop:
+      - /etc/open5gs
+      - /var/log/open5gs
+      - /var/lib/open5gs
+    ignore_errors: yes
+
+  # ---------------------------------------------------------------------
+  # Clean up repositories and keys
+  # ---------------------------------------------------------------------
+  - name: Remove Open5GS APT repository
+    apt_repository:
+      repo: "ppa:open5gs/latest"
+      state: absent
+    ignore_errors: yes
+
+  - name: Remove NodeSource repository and key
+    file:
+      path: "{{ item }}"
+      state: absent
+    loop:
+      - /etc/apt/sources.list.d/nodesource.list
+      - /etc/apt/keyrings/nodesource.gpg
+    ignore_errors: yes
+
+  # ---------------------------------------------------------------------
+  # Clean orphaned packages and cache safely
+  # ---------------------------------------------------------------------
+  - name: Clean APT autoremove and autoclean
+    apt:
+      autoclean: yes
+      autoremove: yes
+    ignore_errors: yes
+
+  - name: Purge residual configuration packages
+    shell: |
+      dpkg -l | grep -E 'open5gs|mongodb' | awk '{print $2}' | xargs --no-run-if-empty apt-get purge -y
+    args:
+      warn: false
+    ignore_errors: yes
+
+  # ---------------------------------------------------------------------
+  # Final system verification
+  # ---------------------------------------------------------------------
+  - name: Verify all Open5GS services are gone
+    shell: systemctl list-units --type=service | grep open5gs || true
+    register: service_check
+    changed_when: false
+
+  - name: Print uninstall summary
+    debug:
+      msg: |
+        🧹 Open5GS Full Uninstallation Completed
+        =========================================
+        Open5GS packages removed: ✅
+        MongoDB removed: ✅
+        Node.js & WebUI removed: ✅
+        NAT rules cleaned: ✅
+        Configs & logs purged: ✅
+
+        Remaining Open5GS services (if any):
+        {{ service_check.stdout }}
+

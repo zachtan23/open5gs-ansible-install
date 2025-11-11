@@ -1,0 +1,267 @@
+---
+- name: Install and Configure Open5GS 5G SA (Stable Setup)
+  hosts: open5gs_5gc
+  become: yes
+
+  vars:
+    mongo_repo: "deb [arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/ubuntu {{ ansible_distribution_release }}/mongodb-org/8.0 multiverse"
+    open5gs_repo: "ppa:open5gs/latest"
+    plmn_mcc: "999"
+    plmn_mnc: "01"
+    tac: 1
+#    amf_ngap_ip: "192.168.100.55"
+#    upf_gtpu_ip: "192.168.100.55"
+
+  tasks:
+  # ---------------------------------------------------------------------
+  # Prerequisites & MongoDB
+  # ---------------------------------------------------------------------
+  - name: Install prerequisites
+    apt:
+      name:
+        - gnupg
+        - curl
+        - apt-transport-https
+        - ca-certificates
+      state: present
+      update_cache: yes
+
+  - name: Add MongoDB key and repo (if not already added)
+    shell: |
+      if [ ! -f /usr/share/keyrings/mongodb-server-8.0.gpg ]; then
+        curl -fsSL https://pgp.mongodb.com/server-8.0.asc | gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg
+        echo "{{ mongo_repo }}" > /etc/apt/sources.list.d/mongodb-org-8.0.list
+      fi
+    args:
+      warn: false
+
+  - name: Install MongoDB
+    apt:
+      name: mongodb-org
+      state: present
+      update_cache: yes
+
+  - name: Ensure MongoDB is running
+    systemd:
+      name: mongod
+      state: started
+      enabled: yes
+
+  # ---------------------------------------------------------------------
+  # Install Open5GS Core
+  # ---------------------------------------------------------------------
+  - name: Add Open5GS repository (stable)
+    apt_repository:
+      repo: "{{ open5gs_repo }}"
+      state: present
+      update_cache: yes
+
+  - name: Install Open5GS
+    apt:
+      name: open5gs
+      state: present
+      update_cache: yes
+
+  - name: Enable IPv4/IPv6 forwarding
+    sysctl:
+      name: "{{ item }}"
+      value: "1"
+      sysctl_set: yes
+      state: present
+    loop:
+      - net.ipv4.ip_forward
+      - net.ipv6.conf.all.forwarding
+
+  # ---------------------------------------------------------------------
+  # Check existence of config files
+  # ---------------------------------------------------------------------
+  - name: Check NRF configuration file exists
+    stat:
+      path: /etc/open5gs/nrf.yaml
+    register: nrf_conf
+
+  - name: Check AMF configuration file exists
+    stat:
+      path: /etc/open5gs/amf.yaml
+    register: amf_conf
+
+  - name: Check UPF configuration file exists
+    stat:
+      path: /etc/open5gs/upf.yaml
+    register: upf_conf
+
+  # ---------------------------------------------------------------------
+  # Update NRF Configuration
+  # ---------------------------------------------------------------------
+  - name: Update NRF MCC
+    replace:
+      path: /etc/open5gs/nrf.yaml
+      regexp: 'mcc:\s*[0-9]+'
+      replace: "mcc: {{ plmn_mcc }}"
+    when: nrf_conf.stat.exists
+    notify: Restart NRF
+
+  - name: Update NRF MNC
+    replace:
+      path: /etc/open5gs/nrf.yaml
+      regexp: 'mnc:\s*[0-9]+'
+      replace: "mnc: {{ plmn_mnc }}"
+    when: nrf_conf.stat.exists
+    notify: Restart NRF
+
+  # ---------------------------------------------------------------------
+  # Update AMF Configuration
+  # ---------------------------------------------------------------------    
+  #  - name: Update AMF NGAP address (only within ngap section)
+  #  replace:
+  #    path: /etc/open5gs/amf.yaml
+  #    regexp: '(?ms)(^ *ngap:\n(?:.*\n)*?server:\n)(?: *- address:\s*[0-9\.]+)'
+  #    replace: '\1      - address: {{ amf_ngap_ip }}'
+  #  when: amf_conf.stat.exists
+  #  notify: Restart AMF
+  #  tags: update_amf_ngap
+
+  - name: Update AMF MCC
+    replace:
+      path: /etc/open5gs/amf.yaml
+      regexp: 'mcc:\s*[0-9]+'
+      replace: "mcc: {{ plmn_mcc }}"
+    when: amf_conf.stat.exists
+    notify: Restart AMF
+
+  - name: Update AMF MNC
+    replace:
+      path: /etc/open5gs/amf.yaml
+      regexp: 'mnc:\s*[0-9]+'
+      replace: "mnc: {{ plmn_mnc }}"
+    when: amf_conf.stat.exists
+    notify: Restart AMF
+
+  - name: Ensure AMF TAC line exists
+    lineinfile:
+      path: /etc/open5gs/amf.yaml
+      regexp: 'tac:\s*[0-9]+'
+      line: "      tac: {{ tac }}"
+      state: present
+    when: amf_conf.stat.exists
+    notify: Restart AMF
+
+  # ---------------------------------------------------------------------
+  # Update UPF Configuration
+  # ---------------------------------------------------------------------
+  #- name: Update UPF GTP-U address
+  #  replace:
+  #    path: /etc/open5gs/upf.yaml
+  #    regexp: 'address:\s*127\.0\.0\.7'
+  #    replace: "address: {{ upf_gtpu_ip }}"
+  #  when: upf_conf.stat.exists
+  #  notify: Restart UPF
+
+  # ---------------------------------------------------------------------
+  # NAT Rules for UE Traffic
+  # ---------------------------------------------------------------------
+  - name: Install iptables-persistent for NAT persistence
+    apt:
+      name: iptables-persistent
+      state: present
+      update_cache: yes
+
+  - name: Ensure iptables NAT rule for UE subnet (IPv4)
+    shell: |
+      iptables -t nat -C POSTROUTING -s 10.45.0.0/16 ! -o ogstun -j MASQUERADE 2>/dev/null ||
+      iptables -t nat -A POSTROUTING -s 10.45.0.0/16 ! -o ogstun -j MASQUERADE
+    args:
+      warn: false
+
+  - name: Ensure ip6tables NAT rule for UE subnet (IPv6)
+    shell: |
+      ip6tables -t nat -C POSTROUTING -s 2001:db8:cafe::/48 ! -o ogstun -j MASQUERADE 2>/dev/null ||
+      ip6tables -t nat -A POSTROUTING -s 2001:db8:cafe::/48 ! -o ogstun -j MASQUERADE
+    args:
+      warn: false
+
+  - name: Save iptables and ip6tables rules (persist)
+    shell: |
+      netfilter-persistent save || true
+    args:
+      warn: false
+
+  # ---------------------------------------------------------------------
+  # WebUI Installation and Fix
+  # ---------------------------------------------------------------------
+  - name: Install Node.js 20 LTS
+    shell: |
+      if ! command -v node >/dev/null 2>&1; then
+        apt update
+        apt install -y ca-certificates curl gnupg
+        mkdir -p /etc/apt/keyrings
+        curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+        NODE_MAJOR=20
+        echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_$NODE_MAJOR.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
+        apt update
+        apt install -y nodejs
+      fi
+    args:
+      warn: false
+
+  - name: Install Open5GS WebUI if missing
+    shell: curl -fsSL https://open5gs.org/open5gs/assets/webui/install | sudo -E bash -
+    args:
+      creates: /usr/lib/node_modules/open5gs/server/index.js
+    environment:
+      NODE_ENV: production
+
+  - name: Update WebUI hostname binding
+    replace:
+      path: /usr/lib/node_modules/open5gs/server/index.js
+      regexp: "const _hostname = process\\.env\\.HOSTNAME \\|\\| 'localhost';"
+      replace: "const _hostname = process.env.HOSTNAME || '0.0.0.0';"
+    notify: Restart WebUI
+
+  # ---------------------------------------------------------------------
+  # Verification
+  # ---------------------------------------------------------------------
+  - name: Ensure Open5GS core services are started
+    systemd:
+      name: "{{ item }}"
+      state: started
+      enabled: yes
+    loop:
+      - open5gs-nrfd
+#      - open5gs-amfd
+#      - open5gs-upfd
+
+  - name: Verify WebUI port 9999
+    wait_for:
+      port: 9999
+      delay: 3
+      timeout: 20
+
+  # ---------------------------------------------------------------------
+  # Handlers
+  # ---------------------------------------------------------------------
+  handlers:
+  - name: Restart NRF
+    systemd:
+      name: open5gs-nrfd
+      state: restarted
+      enabled: yes
+
+  - name: Restart AMF
+    systemd:
+      name: open5gs-amfd
+      state: restarted
+      enabled: yes
+
+  - name: Restart UPF
+    systemd:
+      name: open5gs-upfd
+      state: restarted
+      enabled: yes
+
+  - name: Restart WebUI
+    systemd:
+      name: open5gs-webui
+      state: restarted
+      enabled: yes
+

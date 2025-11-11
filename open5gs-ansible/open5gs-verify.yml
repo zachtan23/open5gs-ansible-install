@@ -1,0 +1,90 @@
+---
+- name: Verify Open5GS 5G SA installation
+  hosts: open5gs_5gc
+  become: yes
+
+  tasks:
+    - name: Verify MongoDB service
+      command: systemctl is-active mongod
+      register: mongodb_status
+      ignore_errors: yes
+
+    - name: Verify Open5GS services
+      command: systemctl is-active {{ item }}
+      loop:
+        - open5gs-amfd
+        - open5gs-smfd
+        - open5gs-upfd
+        - open5gs-ausfd
+        - open5gs-udmd
+        - open5gs-udrd
+        - open5gs-nrfd
+        - open5gs-pcfd
+        - open5gs-nssfd
+        - open5gs-bsfd
+      register: open5gs_services
+      ignore_errors: yes
+
+ # ---------------------------------------------------------------------
+  # Check existence of config files
+  # ---------------------------------------------------------------------
+    - name: Restart AMF
+      stat:
+        path: /etc/open5gs/amf.yaml
+      register: amf_conf
+      changed_when: true
+      notify: Restart AMF
+
+    - name: Restart UPF
+      stat:
+        path: /etc/open5gs/upf.yaml
+      register: upf_conf        
+      changed_when: true
+      notify: Restart UPF
+
+    - name: Verify WebUI port 9999 listening
+      shell: ss -lntp | grep ':9999 ' || true
+      register: webui_port_check
+      changed_when: false
+
+    - name: Print verification summary
+      debug:
+        msg: |
+          🔍 Open5GS Verification Summary
+          =======================================
+          MongoDB: {{ '✅ running' if mongodb_status.rc == 0 else '❌ not running' }}
+          {% for result in open5gs_services.results %}
+          {{ result.item }}: {{ '✅ running' if result.rc == 0 else '❌ not running' }}
+          {% endfor %}
+          WebUI port 9999: {{ '✅ listening' if webui_port_check.stdout | length > 0 else '❌ not found' }}
+          Access: http://{{ ansible_default_ipv4.address }}:9999
+          Login: admin / 1423
+
+  # ---------------------------------------------------------------------
+  # Handlers
+  # ---------------------------------------------------------------------
+  handlers:
+  - name: Restart NRF
+    systemd:
+      name: open5gs-nrfd
+      state: restarted
+      enabled: yes
+
+  - name: Restart AMF
+    systemd:
+      name: open5gs-amfd
+      state: restarted
+      enabled: yes
+
+  - name: Restart UPF
+    systemd:
+      name: open5gs-upfd
+      state: restarted
+      enabled: yes
+
+  - name: Restart WebUI
+    systemd:
+      name: open5gs-webui
+      state: restarted
+      enabled: yes
+
